@@ -1,0 +1,17 @@
+{
+  "client_secrets_path": "",
+  "window_seconds": 10,
+  "warning_count": 3,
+  "limit_count": 5,
+  "mode": "permanent",
+  "first_timeout_seconds": 300,
+  "second_timeout_seconds": 1800,
+  "permanent_after": 3,
+  "repeat_window_hours": 24,
+  "chat_warning": true,
+  "exclude_moderators": true,
+  "exclude_members": false,
+  "excluded_channels": "",
+  "dry_run": true,
+  "retention_days": 29
+}

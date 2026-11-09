@@ -1,0 +1,447 @@
+"""Japanese PySide6 desktop interface."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QTabWidget, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
+)
+
+from .auth import disconnect_google
+from .settings import Settings, data_dir, load_settings, save_settings
+from .storage import History, user_txt
+from .worker import AuthThread, BroadcastThread, MonitorThread
+
+
+def spin(minimum: int, maximum: int, value: int, suffix: str = "") -> QSpinBox:
+    item = QSpinBox()
+    item.setRange(minimum, maximum)
+    item.setValue(value)
+    if suffix:
+        item.setSuffix(suffix)
+    return item
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.base = data_dir()
+        self.base.mkdir(parents=True, exist_ok=True)
+        self.db_path = self.base / "history.sqlite3"
+        self.saved = load_settings()
+        with_history = History(self.db_path)
+        with_history.purge_expired(self.saved.retention_days)
+        with_history.close()
+        self.monitor: MonitorThread | None = None
+        self.auth_job: AuthThread | None = None
+        self.broadcast_job: BroadcastThread | None = None
+        self.broadcasts: list[dict] = []
+        self.selected_channel_id = ""
+
+        self.setWindowTitle("LiveChat Guard v0.1.0")
+        self.resize(1050, 740)
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+        self.tabs.addTab(self._dashboard(), "監視ダッシュボード")
+        self.tabs.addTab(self._settings(), "監視ルール・接続設定")
+        self.tabs.addTab(self._history_tab(), "ユーザー別履歴")
+        self.statusBar().showMessage(f"データ保存先: {self.base}")
+        self._refresh_history_users()
+        self.timer = QTimer(self)
+        self.timer.setInterval(2500)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start()
+
+    def _dashboard(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel("YouTube Live コメント監視"))
+        self.connection = QLabel("Google認証後に配信一覧を取得してください。")
+        layout.addWidget(self.connection)
+        row = QHBoxLayout()
+        self.fetch_button = QPushButton("自分の配信一覧を取得")
+        self.fetch_button.clicked.connect(self._fetch_broadcasts)
+        row.addWidget(self.fetch_button)
+        self.broadcast_combo = QComboBox()
+        self.broadcast_combo.setMinimumWidth(350)
+        row.addWidget(self.broadcast_combo, stretch=1)
+        layout.addLayout(row)
+
+        actions = QHBoxLayout()
+        self.start_button = QPushButton("▶ 監視開始")
+        self.start_button.clicked.connect(self._start)
+        self.stop_button = QPushButton("■ 監視停止")
+        self.stop_button.clicked.connect(self._stop)
+        self.stop_button.setEnabled(False)
+        actions.addWidget(self.start_button)
+        actions.addWidget(self.stop_button)
+        layout.addLayout(actions)
+        self.monitor_state = QLabel("停止中")
+        layout.addWidget(self.monitor_state)
+        self.events = QTableWidget(0, 3)
+        self.events.setHorizontalHeaderLabels(["イベント", "ユーザー", "内容"])
+        self.events.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.events.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.events)
+        note = QLabel("※ 監視開始後のコメントのみ判定します。テストモードではAPIによる警告送信・BANは行いません。")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        return page
+
+    def _settings(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        form = QFormLayout()
+        self.seconds = spin(1, 3600, self.saved.window_seconds, " 秒")
+        self.warn = spin(2, 99, self.saved.warning_count, " 回")
+        self.limit = spin(3, 100, self.saved.limit_count, " 回")
+        self.mode = QComboBox()
+        self.mode.addItem("警告 → 永久BAN【標準】", "permanent")
+        self.mode.addItem("警告 → 一時制限 → 再犯時の制限強化", "staged")
+        self.mode.setCurrentIndex(0 if self.saved.mode == "permanent" else 1)
+        self.first_duration = spin(1, 86400, self.saved.first_timeout_seconds, " 秒")
+        self.second_duration = spin(1, 86400, self.saved.second_timeout_seconds, " 秒")
+        self.permanent_after = spin(2, 10, self.saved.permanent_after, " 回目")
+        self.repeat_hours = spin(1, 720, self.saved.repeat_window_hours, " 時間")
+        self.retention = spin(1, 29, self.saved.retention_days, " 日")
+        form.addRow("連投判定の最大コメント間隔", self.seconds)
+        form.addRow("警告発動までの連投回数", self.warn)
+        form.addRow("制限発動までの連投回数", self.limit)
+        form.addRow("処理モード", self.mode)
+        form.addRow("初回一時制限", self.first_duration)
+        form.addRow("2回目以降の一時制限", self.second_duration)
+        form.addRow("何回目の違反で永久BAN", self.permanent_after)
+        form.addRow("再犯の判定期間", self.repeat_hours)
+        form.addRow("履歴自動削除までの期間", self.retention)
+        layout.addLayout(form)
+        self.chat_warning = QCheckBox("警告時にYouTubeチャットへ警告文を送信")
+        self.chat_warning.setChecked(self.saved.chat_warning)
+        self.exclude_mod = QCheckBox("配信者・モデレーターは判定から除外")
+        self.exclude_mod.setChecked(self.saved.exclude_moderators)
+        self.exclude_members = QCheckBox("メンバーシップ加入者を判定から除外")
+        self.exclude_members.setChecked(self.saved.exclude_members)
+        self.dry_run = QCheckBox("テストモード（警告送信・BANを実行しない）")
+        self.dry_run.setChecked(self.saved.dry_run)
+        for checkbox in (self.chat_warning, self.exclude_mod, self.exclude_members, self.dry_run):
+            layout.addWidget(checkbox)
+
+        exempt_row = QHBoxLayout()
+        exempt_row.addWidget(QLabel("除外するチャンネルID（1行1件）"))
+        self.exclusions = QPlainTextEdit(self.saved.excluded_channels)
+        self.exclusions.setMaximumHeight(60)
+        exempt_row.addWidget(self.exclusions, stretch=1)
+        layout.addLayout(exempt_row)
+
+        oauth = QGroupBox("Google OAuth 接続（APIキーではBANできません）")
+        oauth_layout = QVBoxLayout(oauth)
+        client_row = QHBoxLayout()
+        self.client_path = QLineEdit(self.saved.client_secrets_path)
+        self.client_path.setPlaceholderText("Google CloudのデスクトップOAuthクライアントJSONのパス")
+        browse = QPushButton("参照")
+        browse.clicked.connect(self._browse_client)
+        client_row.addWidget(self.client_path, stretch=1)
+        client_row.addWidget(browse)
+        oauth_layout.addLayout(client_row)
+        buttons = QHBoxLayout()
+        self.login_button = QPushButton("Googleアカウントで認証")
+        self.login_button.clicked.connect(self._login)
+        disconnect = QPushButton("保存した認証を削除")
+        disconnect.clicked.connect(self._disconnect)
+        buttons.addWidget(self.login_button)
+        buttons.addWidget(disconnect)
+        oauth_layout.addLayout(buttons)
+        layout.addWidget(oauth)
+        save = QPushButton("設定を保存")
+        save.clicked.connect(self._save_settings)
+        layout.addWidget(save)
+        layout.addStretch()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(page)
+        return scroll
+
+    def _history_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        row = QHBoxLayout()
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("ユーザー名・チャンネルIDで検索")
+        self.search_box.textChanged.connect(self._refresh_history_users)
+        self.only_actions = QCheckBox("警告・BAN履歴あり")
+        self.only_actions.stateChanged.connect(self._refresh_history_users)
+        row.addWidget(self.search_box, stretch=1)
+        row.addWidget(self.only_actions)
+        layout.addLayout(row)
+
+        self.users = QTableWidget(0, 4)
+        self.users.setHorizontalHeaderLabels(["ユーザー名", "チャンネルID", "コメント", "処理履歴"])
+        self.users.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.users.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.users.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.users.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.users.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.users.itemSelectionChanged.connect(self._show_history)
+        layout.addWidget(self.users, stretch=2)
+
+        self.history_details = QPlainTextEdit()
+        self.history_details.setReadOnly(True)
+        layout.addWidget(self.history_details, stretch=3)
+        actions = QHBoxLayout()
+        refresh = QPushButton("履歴を再読込")
+        refresh.clicked.connect(self._refresh_history_users)
+        export = QPushButton("選択ユーザーの履歴をTXTで保存")
+        export.clicked.connect(self._export_user)
+        delete = QPushButton("選択ユーザーのローカル履歴を削除")
+        delete.clicked.connect(self._delete_user)
+        actions.addWidget(refresh)
+        actions.addWidget(export)
+        actions.addWidget(delete)
+        layout.addLayout(actions)
+        layout.addWidget(QLabel("※ 履歴削除はこのPC内の記録のみです。YouTube側のコメントやBANは変化しません。"))
+        return page
+
+    def _collect(self) -> Settings:
+        result = Settings(
+            client_secrets_path=self.client_path.text().strip(),
+            window_seconds=self.seconds.value(), warning_count=self.warn.value(),
+            limit_count=self.limit.value(), mode=self.mode.currentData(),
+            first_timeout_seconds=self.first_duration.value(),
+            second_timeout_seconds=self.second_duration.value(),
+            permanent_after=self.permanent_after.value(),
+            repeat_window_hours=self.repeat_hours.value(),
+            chat_warning=self.chat_warning.isChecked(),
+            exclude_moderators=self.exclude_mod.isChecked(),
+            exclude_members=self.exclude_members.isChecked(),
+            excluded_channels=self.exclusions.toPlainText().strip(),
+            dry_run=self.dry_run.isChecked(), retention_days=self.retention.value(),
+        )
+        result.validate()
+        return result
+
+    def _save_settings(self) -> bool:
+        try:
+            self.saved = self._collect()
+            save_settings(self.saved)
+            self.statusBar().showMessage("設定を保存しました。監視中の場合は次の監視開始時から反映されます。", 7000)
+            return True
+        except Exception as exc:
+            QMessageBox.warning(self, "設定エラー", str(exc))
+            return False
+
+    def _browse_client(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "OAuthクライアントJSONを選択", "", "JSON (*.json)")
+        if path:
+            self.client_path.setText(path)
+
+    def _login(self) -> None:
+        if not self._save_settings():
+            return
+        if self.auth_job is not None and self.auth_job.isRunning():
+            return
+        self.login_button.setEnabled(False)
+        self.auth_job = AuthThread(self.saved.client_secrets_path)
+        self.auth_job.completed.connect(lambda: self.connection.setText("認証成功。配信一覧を取得してください。"))
+        self.auth_job.failed.connect(lambda error: QMessageBox.warning(self, "Google認証失敗", error))
+        self.auth_job.finished.connect(lambda: self.login_button.setEnabled(True))
+        self.auth_job.start()
+
+    def _disconnect(self) -> None:
+        if self.monitor is not None and self.monitor.isRunning():
+            QMessageBox.warning(self, "監視中", "先に監視を停止してください。")
+            return
+        try:
+            disconnect_google()
+            self.connection.setText("保存した認証を削除しました。")
+            self.broadcast_combo.clear()
+            self.broadcasts = []
+        except Exception as exc:
+            QMessageBox.warning(self, "認証削除失敗", str(exc))
+
+    def _fetch_broadcasts(self) -> None:
+        if self.broadcast_job is not None and self.broadcast_job.isRunning():
+            return
+        self.fetch_button.setEnabled(False)
+        self.connection.setText("配信一覧を取得中…")
+        self.broadcast_job = BroadcastThread()
+        self.broadcast_job.completed.connect(self._set_broadcasts)
+        self.broadcast_job.failed.connect(lambda error: self.connection.setText(f"取得失敗: {error}"))
+        self.broadcast_job.finished.connect(lambda: self.fetch_button.setEnabled(True))
+        self.broadcast_job.start()
+
+    def _set_broadcasts(self, broadcasts: list[dict]) -> None:
+        self.broadcasts = broadcasts
+        self.broadcast_combo.clear()
+        for stream in broadcasts:
+            self.broadcast_combo.addItem(f"{stream['title']} ({stream['id']})", stream)
+        self.connection.setText(f"ライブ配信が {len(broadcasts)} 件見つかりました。"
+                                if broadcasts else "ライブ配信が見つかりません。YouTube側の配信状態をご確認ください。")
+
+    def _start(self) -> None:
+        if self.monitor is not None and self.monitor.isRunning():
+            return
+        if not self._save_settings():
+            return
+        broadcast = self.broadcast_combo.currentData()
+        if not isinstance(broadcast, dict):
+            QMessageBox.warning(self, "配信未選択", "先に配信一覧を取得して対象の配信を選択してください。")
+            return
+        if not self.saved.dry_run:
+            answer = QMessageBox.question(
+                self, "実制限の確認",
+                "テストモードがOFFです。違反が発生すると実際にYouTubeへ警告・BAN操作を送信します。\n"
+                f"モード: {self.mode.currentText()}\n続行しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.monitor = MonitorThread(self.saved, self.db_path, broadcast)
+        self.monitor.notification.connect(self._receive_event)
+        self.monitor.status.connect(self.monitor_state.setText)
+        self.monitor.failed.connect(self._worker_error)
+        self.monitor.finished.connect(self._monitor_finished)
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.fetch_button.setEnabled(False)
+        self.monitor_state.setText("接続中…" + ("（テストモード）" if self.saved.dry_run else "（実制限有効）"))
+        self.monitor.start()
+
+    def _stop(self) -> None:
+        if self.monitor is not None and self.monitor.isRunning():
+            self.monitor.stop()
+            self.monitor_state.setText("停止処理中…")
+            self.stop_button.setEnabled(False)
+
+    def _monitor_finished(self) -> None:
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.fetch_button.setEnabled(True)
+
+    def _worker_error(self, error: str) -> None:
+        self.statusBar().showMessage(error, 16000)
+        self._receive_event({"label": "error", "name": "システム", "detail": error})
+
+    def _receive_event(self, event: dict) -> None:
+        row = 0
+        self.events.insertRow(row)
+        for column, value in enumerate((event.get("label", ""), event.get("name", ""),
+                                        event.get("detail", ""))):
+            self.events.setItem(row, column, QTableWidgetItem(str(value)))
+        if self.events.rowCount() > 300:
+            self.events.removeRow(300)
+
+    def _tick(self) -> None:
+        if self.tabs.currentIndex() == 2:
+            self._refresh_history_users()
+
+    def _refresh_history_users(self) -> None:
+        current = self.selected_channel_id
+        db = History(self.db_path)
+        try:
+            results = db.recent_users(self.search_box.text(), self.only_actions.isChecked())
+        finally:
+            db.close()
+        self.users.blockSignals(True)
+        self.users.setRowCount(0)
+        selected_row = -1
+        for number, item in enumerate(results):
+            self.users.insertRow(number)
+            data = (item["display_name"], item["channel_id"],
+                    str(item["messages"]), str(item["actions"]))
+            for i, value in enumerate(data):
+                self.users.setItem(number, i, QTableWidgetItem(value))
+            if item["channel_id"] == current:
+                selected_row = number
+        if selected_row >= 0:
+            self.users.selectRow(selected_row)
+        self.users.blockSignals(False)
+        if selected_row == -1:
+            self.selected_channel_id = ""
+            self.history_details.clear()
+        else:
+            self._show_history()
+
+    def _show_history(self) -> None:
+        selected = self.users.selectedItems()
+        if not selected:
+            return
+        channel_id = self.users.item(selected[0].row(), 1).text()
+        self.selected_channel_id = channel_id
+        db = History(self.db_path)
+        try:
+            text = user_txt(channel_id, db.history_for_user(channel_id))
+        finally:
+            db.close()
+        if text != self.history_details.toPlainText():
+            self.history_details.setPlainText(text)
+
+    def _export_user(self) -> None:
+        channel_id = self.selected_channel_id
+        if not channel_id:
+            QMessageBox.information(self, "未選択", "ユーザーを選択してください。")
+            return
+        db = History(self.db_path)
+        try:
+            data = user_txt(channel_id, db.history_for_user(channel_id))
+        finally:
+            db.close()
+        export_dir = self.base / "exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        # Identifiers may not be filesystem-safe if data came from unexpected sources.
+        safe_id = "".join(c for c in channel_id if c.isalnum() or c in "-_")
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "ユーザー履歴のTXT保存", str(export_dir / f"{safe_id}.txt"), "Text files (*.txt)")
+        if filename:
+            try:
+                Path(filename).write_text(data, encoding="utf-8-sig")
+                self.statusBar().showMessage(f"保存しました: {filename}", 10000)
+            except OSError as exc:
+                QMessageBox.warning(self, "保存失敗", str(exc))
+
+    def _delete_user(self) -> None:
+        channel_id = self.selected_channel_id
+        if not channel_id:
+            return
+        response = QMessageBox.question(
+            self, "ローカル履歴削除",
+            f"{channel_id} の保存済みコメント・警告・BAN履歴をこのPCから削除します。\n"
+            "YouTube上のコメントやBANには影響しません。続行しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if response != QMessageBox.StandardButton.Yes:
+            return
+        db = History(self.db_path)
+        try:
+            db.delete_user(channel_id)
+        finally:
+            db.close()
+        self.selected_channel_id = ""
+        self._refresh_history_users()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        if self.monitor is not None and self.monitor.isRunning():
+            self.monitor.stop()
+            # APIs have network timeouts; do not destroy a running Qt thread.
+            self.monitor.wait()
+        for job in (self.auth_job, self.broadcast_job):
+            if job is not None and job.isRunning():
+                job.wait()
+        event.accept()
+
+
+def main() -> None:
+    app = QApplication([])
+    app.setApplicationName("LiveChatGuard")
+    try:
+        window = MainWindow()
+    except Exception as exc:
+        QMessageBox.critical(None, "起動失敗", f"設定またはデータを読み込めませんでした。\n{exc}")
+        raise SystemExit(1) from exc
+    window.show()
+    raise SystemExit(app.exec())

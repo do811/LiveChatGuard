@@ -1,0 +1,52 @@
+# 設計ノート
+
+## データフロー
+
+```text
+Google OAuth（OS資格情報ストア）
+        │
+        ▼
+YouTube Live API（liveBroadcasts.list / liveChatMessages.list）
+        │
+        ▼
+MonitorThread  ───→ SQLite History ──→ GUI履歴 ──→ TXTエクスポート
+        │
+        ▼
+除外判定 → ユーザー単位のStreakDetector
+        │
+        ├─ 3連投 → 警告を記録 → 必要ならliveChatMessages.insert
+        └─ 5連投 → モード判定 → liveChatBans.insert
+                                 │
+                                 └─ 実行成功/失敗/テストをSQLiteへ記録
+```
+
+## 一連投の状態
+
+- ユーザーごとに `last_published_at / count / warned / limited` を保持。
+- 次のコメントとの間隔が `0 <= Δt <= window_seconds` なら `count += 1`。
+- `Δt > window_seconds` やタイムスタンプ逆転では1にリセット。
+- 一連投中は警告1回、制限1回まで。閾値は `2 <= warning_count < limit_count`。
+- 監視開始後に届く過去ログを判定に使わないよう、初回APIレスポンスをスキップする。
+- SQLiteにmessage IDのUNIQUE制約を設定。再取得したコメントは重複記録・重複判定しない。
+
+## データ保存
+
+`messages(message_id, broadcast_id, channel_id, display_name, body, published_at)`
+
+`actions(id, broadcast_id, channel_id, display_name, kind, detail, outcome, timestamp, ban_id)`
+
+- `outcome`: `success`, `failure`, `dry_run` の3種類。
+- `kind`: `warning`, `temporary_ban`, `permanent_ban`。
+- 再犯カウントは `temporary_ban` かつ `success` のみ参照。
+- トークン・OAuth secretsはSQLiteや設定ファイルに保存しない。
+- SQLiteはWALモードを利用し、GUIと監視スレッドはそれぞれ独立したDB接続を作成。
+- APIデータは既定29日保存。起動時／監視開始時に古いデータを削除（常駐中の毎日掃除は今後の改善対象）。
+
+## 明示的な制限・今後の課題
+
+- YouTube側ではライブチャットが終了した後のコメント取得はできない。
+- YouTube API/回線の遅延により制限開始までに追加コメントが投稿される可能性がある。
+- 監視中のユーザーが膨大な場合、StreakDetectorのメモリから古いユーザー状態を定期的に掃除できると良い。
+- 一時BAN解除・BAN取消操作、イベント詳細検索、期間指定検索は未実装。
+- `list` 方式はネットワーク・クォータ負担が高いため、公式推奨の `streamList` 移行を検討する。
+- ログ出力をGitに含めないこと。履歴には第三者の発言・ユーザーIDが含まれる。
