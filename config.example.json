@@ -13,5 +13,7 @@
   "exclude_members": false,
   "excluded_channels": "",
   "dry_run": true,
-  "retention_days": 29
+  "retention_days": 29,
+  "minimum_poll_seconds": 120,
+  "fetch_mode": "stream"
 }

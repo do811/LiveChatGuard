@@ -62,4 +62,7 @@ class YouTubeAPI:
         if seconds is not None:
             snippet["banDurationSeconds"] = str(seconds)
         result = self.service.liveChatBans().insert(part="snippet", body={"snippet": snippet}).execute()
-        return str(result.get("id", ""))
+        ban_id = result.get("id")
+        if not ban_id:
+            raise RuntimeError("YouTubeがBAN IDを返さなかったため、成功と判断できません。")
+        return str(ban_id)

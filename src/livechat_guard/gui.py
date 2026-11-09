@@ -43,7 +43,7 @@ class MainWindow(QMainWindow):
         self.broadcasts: list[dict] = []
         self.selected_channel_id = ""
 
-        self.setWindowTitle("LiveChat Guard v0.1.0")
+        self.setWindowTitle("LiveChat Guard v0.2.0")
         self.resize(1050, 740)
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -84,11 +84,12 @@ class MainWindow(QMainWindow):
         self.monitor_state = QLabel("停止中")
         layout.addWidget(self.monitor_state)
         self.events = QTableWidget(0, 3)
-        self.events.setHorizontalHeaderLabels(["イベント", "ユーザー", "内容"])
+        self.events.setHorizontalHeaderLabels(["イベント", "ユーザー", "内容・API結果"])
         self.events.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.events.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.events)
-        note = QLabel("※ 監視開始後のコメントのみ判定します。テストモードではAPIによる警告送信・BANは行いません。")
+        note = QLabel("※ テストモードではBAN・警告投稿は行いません。BAN成功でも過去のコメントは自動削除されません。\n"
+                      "※ リアルタイム受信モードでは定期取得はしません。クォータ超過時は再試行を止めます。")
         note.setWordWrap(True)
         layout.addWidget(note)
         return page
@@ -98,6 +99,11 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         form = QFormLayout()
         self.seconds = spin(1, 3600, self.saved.window_seconds, " 秒")
+        self.fetch_mode = QComboBox()
+        self.fetch_mode.addItem("リアルタイム受信（推奨・streamList）", "stream")
+        self.fetch_mode.addItem("定期取得（REST・予備モード）", "poll")
+        self.fetch_mode.setCurrentIndex(0 if self.saved.fetch_mode == "stream" else 1)
+        self.poll_seconds = spin(5, 300, self.saved.minimum_poll_seconds, " 秒")
         self.warn = spin(2, 99, self.saved.warning_count, " 回")
         self.limit = spin(3, 100, self.saved.limit_count, " 回")
         self.mode = QComboBox()
@@ -110,6 +116,8 @@ class MainWindow(QMainWindow):
         self.repeat_hours = spin(1, 720, self.saved.repeat_window_hours, " 時間")
         self.retention = spin(1, 29, self.saved.retention_days, " 日")
         form.addRow("連投判定の最大コメント間隔", self.seconds)
+        form.addRow("コメント取得方式", self.fetch_mode)
+        form.addRow("定期取得モードの最短間隔", self.poll_seconds)
         form.addRow("警告発動までの連投回数", self.warn)
         form.addRow("制限発動までの連投回数", self.limit)
         form.addRow("処理モード", self.mode)
@@ -208,7 +216,9 @@ class MainWindow(QMainWindow):
     def _collect(self) -> Settings:
         result = Settings(
             client_secrets_path=self.client_path.text().strip(),
-            window_seconds=self.seconds.value(), warning_count=self.warn.value(),
+            window_seconds=self.seconds.value(),
+            minimum_poll_seconds=self.poll_seconds.value(), fetch_mode=self.fetch_mode.currentData(),
+            warning_count=self.warn.value(),
             limit_count=self.limit.value(), mode=self.mode.currentData(),
             first_timeout_seconds=self.first_duration.value(),
             second_timeout_seconds=self.second_duration.value(),

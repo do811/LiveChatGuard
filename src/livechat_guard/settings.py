@@ -22,6 +22,8 @@ def data_dir() -> Path:
 class Settings:
     client_secrets_path: str = ""
     window_seconds: int = 10
+    minimum_poll_seconds: int = 120  # REST fallback interval, not detector window
+    fetch_mode: str = "stream"  # stream (push / default) | poll (REST fallback)
     warning_count: int = 3
     limit_count: int = 5
     mode: str = "permanent"  # permanent | staged
@@ -37,6 +39,10 @@ class Settings:
     retention_days: int = 29  # YouTube API Data retention upper bound: 30 days
 
     def validate(self) -> None:
+        if self.fetch_mode not in ("stream", "poll"):
+            raise ValueError("不正なコメント取得方式です。")
+        if not 5 <= self.minimum_poll_seconds <= 300:
+            raise ValueError("API問い合わせ間隔は5～300秒で指定してください。")
         if not 1 <= self.window_seconds <= 3600:
             raise ValueError("判定秒数は1～3600で指定してください。")
         if not 2 <= self.warning_count < self.limit_count <= 100:

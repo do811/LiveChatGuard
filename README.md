@@ -1,14 +1,15 @@
 # LiveChat Guard
 
-**YouTubeライブのチャットをPythonで監視し、短い間隔で連続投稿するユーザーへの警告・投稿制限を支援する、Windows向けGUIアプリ（日本語対応）**
+**YouTubeライブのチャットをPythonで監視し、短い間隔で連続投稿するユーザーへの警告・投稿制限を支援する、Windows向けGUIアプリ（日本語対応）です。**
 
-> **ステータス：v0.1.0 / 初期実装（要実配信検証）**  
+> **ステータス：v0.2.0 / ストリーミング受信対応（要実配信検証）**  
 > コメント判定・データ保存の自動テストを付属していますが、実際のYouTube配信アカウントへの接続／警告送信／BAN操作は、このリポジトリの作成時点では検証していません。まずはテスト配信で確認してください。
 
 ## 主な機能
 
 - 自分のライブ配信をOAuth 2.0認証で取得し、GUIから選択
-- YouTube公式 `liveChatMessages.list` APIでコメントを継続取得
+- **YouTube公式 `liveChatMessages.streamList`（gRPC）で新着コメントをプッシュ受信（標準・クォータ節約）**
+- 代替として `liveChatMessages.list` による定期取得も選択可能（初期120秒間隔）
 - **コメント1 → 次のコメントがn秒以内 → 次のコメントがn秒以内…** という連続投稿判定
 - 標準モード：**警告（デフォルト3回目）→ 永久BAN（デフォルト5回目）**
 - オプションモード：**警告 → 一時BAN → 再犯時に強化 → 規定回数で永久BAN**
@@ -17,6 +18,7 @@
 - GUIでユーザー履歴を検索・閲覧し、読みやすい **.txt** に書き出し
 - 配信者・モデレーター・メンバー・指定チャンネルの除外設定
 - **テストモードが初期設定でON**（判定はするがYouTubeには投稿もBANもしない）
+- `streamList` が切断された場合は続きから再開し、メッセージIDで重複排除
 - 認証トークンはOSの資格情報ストアに保存。設定JSONには保存しない
 - 保存済みAPIデータを最大29日で自動削除、ユーザー単位でもローカル履歴を削除可能
 
@@ -92,6 +94,10 @@ PowerShellの実行ポリシーにより仮想環境を有効化できない場�
 - **監視ルール・接続設定**：判定秒数、警告回数、BAN回数、モード、再犯条件、OAuth、テストモード、除外設定
 - **ユーザー別履歴**：ユーザー検索、コメント・警告・BANの時系列閲覧、TXT書き出し、ローカル履歴の削除
 
+**取得方式は「リアルタイム受信（推奨）」を選択してください。** 以前のv0.1.1の設定が残っている場合も、新しい `fetch_mode` は自動的に `stream` になります。
+
+定期取得モードの120秒設定は**連投判定時間とは独立**しています。取得が遅れても、YouTubeの投稿時刻で判定します。ただし違反検知から制限発動まで最大約2分の遅延が生じ、投稿が集中すると一部のメッセージを取りこぼす可能性があるため、BAN目的ではストリーミングを推奨します。
+
 変更した設定は保存後、**次の監視開始**から反映されます。
 
 ## 履歴の書き出し例
@@ -143,17 +149,20 @@ OAuth認証情報は、Pythonの `keyring` 経由でWindows資格情報マネー
 ## YouTube APIの制約・注意
 
 - **コメントの投稿自体を未然には止められません。** コメントを取得してから違反判定し、その後に制限します。投稿とAPI受信には遅延があります。
-- 初回のメッセージ取得は**過去ログを含むため判定対象外**にします。監視開始直後の数件は取りこぼす可能性があります。
-- 現在は `liveChatMessages.list` によるポーリング方式です。YouTubeが返す `pollingIntervalMillis` に従い、クォータ超過を抑制します。公式はより効率的な `streamList` を推奨しています（将来の改善候補）。
+- 監視開始前のコメントは、各メッセージの `publishedAt` で除外します。初回の配信レスポンスが過去ログを含んでいても、その内容でBANしません。タイムスタンプの秒精度の都合で開始と同じ秒の一部コメントは含まれ得ます。
+- **標準はgRPCの `liveChatMessages.streamList` 方式です。** 最初に接続し、新しいコメントが届くたびにYouTubeから送信されるため、空のコメント欄を繰り返し問い合わせません。接続には5ユニット必要です。通信切断時は最後の `nextPageToken` から再開します。クォータ残量が0ならこの方法でも利用できません。
+- **予備のREST定期取得** は `liveChatMessages.list` を使用し、YouTubeの `pollingIntervalMillis` と設定した最短間隔の長い方を守ります（新規設定の既定値は120秒）。`list` は現在5ユニット/回です。120秒間隔なら30回/時間 × 5 = **約150ユニット/時間**（コメント取得のみの目安）。高負荷チャットではページ上限などで取りこぼしの可能性があります。
 - YouTube側の権限が不足していると警告やBANは失敗します。失敗はイベント・履歴に記録します。
 - すべてのチャットの種類を数えるわけではなく、通常のテキストチャット `textMessageEvent` のみを判定します。
-- 永久BANはYouTube上の**ライブチャット参加禁止**です。Googleアカウント全体を停止するものではありません。
+- 永久BANはYouTube上の**ライブチャット参加禁止**です。
 - OAuthの検証状態やテストユーザー登録、スコープ審査、クォータ制限により使用できない場合があります。第三者向け公開前にGoogleの要件を確認してください。
 - YouTube API Servicesポリシーに合わせ、アプリのSQLite記録は最大29日で削除します。**エクスポートしたTXT・バックアップ等は自動削除されないため、利用者側で期限内に削除・適切に管理してください。** 認証失効・APIアクセス撤回時の保存データの取り扱いも考慮してください。
 - ここではGoogleのアカウント認証情報そのものを収集しません。OAuthクライアントJSONに含まれるシークレットやtokenは公開リポジトリに含めないでください。
 
 公式ドキュメント：
 
+- [LiveChatMessages: streamList](https://developers.google.com/youtube/data/live/reference/rest/v3/liveChatMessages/streamList)
+- [Streaming Live Chat (gRPC / Python)](https://developers.google.com/youtube/data/live/streaming-live-chat)
 - [LiveChatMessages: list](https://developers.google.com/youtube/data/live/reference/rest/v3/liveChatMessages/list)
 - [LiveChatBans: insert](https://developers.google.com/youtube/data/live/reference/rest/v3/liveChatBans/insert)
 - [LiveChatMessages: insert](https://developers.google.com/youtube/data/live/reference/rest/v3/liveChatMessages/insert)
@@ -169,7 +178,8 @@ LiveChatGuard/
 │   ├── gui.py              # PySide6 GUI
 │   ├── settings.py         # 設定保存と検証
 │   ├── auth.py             # OAuth認証・安全なトークン保存
-│   ├── youtube_api.py      # YouTube公式API
+│   ├── youtube_api.py      # YouTube公式REST API
+│   ├── stream_grpc.py      # streamList / gRPCの受信・protobuf互換形式
 │   ├── moderation.py       # 連投判定エンジン
 │   ├── storage.py          # SQLite・TXT出力
 │   └── worker.py           # 別スレッド監視・制限処理
@@ -193,13 +203,32 @@ LiveChatGuard/
 
 オフラインの判定とSQLiteテストは、実際のGoogleアカウントやAPIキーなしで動作します。**認証や実制限操作に関するE2Eテストは未実施**です。
 
+## v0.2.0：新着コメントのプッシュ受信（推奨）
+
+- **通常は「リアルタイム受信（推奨・streamList）」** を選択してください。API呼び出しを定期的に繰り返さず、新着コメントが届き次第受け取ります。**コールバックで外部からPCにアクセスする仕組みではなく、PCからYouTubeへ張った接続を維持する方式**です。
+- 公式gRPC APIを利用しています。`grpcio` と `protobuf` は `pip install -e .` で自動導入されます。`grpcio-tools` やコード生成は不要です。
+- ストリームが切れた場合、最後の `nextPageToken` から再接続します。重複コメントはDBのメッセージIDで排除します。API側のエラー時には状況に応じて停止または待機し、無限にリクエストしません。
+- 過去コメントの除外と連投判定には、受信時刻でなくYouTubeの `publishedAt` を使います。判定秒数・警告回数・BAN回数・制限モード・TXT履歴・OAuthは従来どおりです。
+- GUIの「定期取得（REST・予備モード）」に切り替えると、初期120秒間隔で問い合わせます。コメント間隔の判定そのものは変わりませんが、制限が遅くなるため、テスト用途を想定しています。
+- **`quotaExceeded` が発生した時点でその日のクォータを使い切っている場合、方式を変えても即時復旧はしません。** Google CloudでAPI使用量とリセットを確認してください。
+
+**更新方法（旧バージョンから）**：監視を停止してアプリを終了 → 新ZIPのソースファイルを上書き（`%LOCALAPPDATA%\LiveChatGuard` にあるログ・設定を消さない） → `.\.venv\Scripts\python.exe -m pip install -e .` で依存関係を更新 → アプリを再起動してください。認証情報はOS側に残るので、基本的にOAuthの再認証は必要ありません。
+
+**未検証事項**：実配信のgRPC接続、GoogleアカウントでのOAuth実動作、BAN・警告送信はこの制作環境では検証できていません。配信者アカウントで必ずテストモードから試してください。
+
+## v0.1.1で追加した安全対策（継続）
+
+- `quotaExceeded` 等を検知したら無駄な再試行を避けます。
+- 「テストのみ・実行なし」「API成功」「API失敗」をGUI履歴に明示します。
+- BAN IDがYouTube APIから返らないときは、成功と判断しません。
+- BAN成功後でも過去のコメントを自動削除する機能は未搭載です。
+
 ## 今後の改善候補
 
-- gRPC `streamList` による遅延・クォータ改善
+- 実配信での `streamList` 回線耐久テスト・APIクォータ計測
 - APIレベルの手動BAN解除、手動BAN操作、コメント削除
-- GUIからのBAN理由編集、警告文テンプレート編集
 - 履歴の期間指定・配信別絞り込み、コメント増加率グラフ
-- PyInstallerによる署名付きWindowsアプリの配布
+- PyInstallerによるWindowsアプリの配布
 
 ## ライセンス
 

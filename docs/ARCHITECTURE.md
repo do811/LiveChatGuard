@@ -6,7 +6,7 @@
 Google OAuth（OS資格情報ストア）
         │
         ▼
-YouTube Live API（liveBroadcasts.list / liveChatMessages.list）
+YouTube Live API（liveBroadcasts.list / streamList【標準】 / list【予備】）
         │
         ▼
 MonitorThread  ───→ SQLite History ──→ GUI履歴 ──→ TXTエクスポート
@@ -26,7 +26,7 @@ MonitorThread  ───→ SQLite History ──→ GUI履歴 ──→ TXTエ�
 - 次のコメントとの間隔が `0 <= Δt <= window_seconds` なら `count += 1`。
 - `Δt > window_seconds` やタイムスタンプ逆転では1にリセット。
 - 一連投中は警告1回、制限1回まで。閾値は `2 <= warning_count < limit_count`。
-- 監視開始後に届く過去ログを判定に使わないよう、初回APIレスポンスをスキップする。
+- 初回に届く過去ログは、`publishedAt` が監視開始より古い場合に除外する。初回レスポンス全体を破棄するわけではない。
 - SQLiteにmessage IDのUNIQUE制約を設定。再取得したコメントは重複記録・重複判定しない。
 
 ## データ保存
@@ -35,7 +35,7 @@ MonitorThread  ───→ SQLite History ──→ GUI履歴 ──→ TXTエ�
 
 `actions(id, broadcast_id, channel_id, display_name, kind, detail, outcome, timestamp, ban_id)`
 
-- `outcome`: `success`, `failure`, `dry_run` の3種類。
+- `outcome`: `success`, `failure`, `dry_run`, `local_only` の4種類。
 - `kind`: `warning`, `temporary_ban`, `permanent_ban`。
 - 再犯カウントは `temporary_ban` かつ `success` のみ参照。
 - トークン・OAuth secretsはSQLiteや設定ファイルに保存しない。
@@ -48,5 +48,6 @@ MonitorThread  ───→ SQLite History ──→ GUI履歴 ──→ TXTエ�
 - YouTube API/回線の遅延により制限開始までに追加コメントが投稿される可能性がある。
 - 監視中のユーザーが膨大な場合、StreakDetectorのメモリから古いユーザー状態を定期的に掃除できると良い。
 - 一時BAN解除・BAN取消操作、イベント詳細検索、期間指定検索は未実装。
-- `list` 方式はネットワーク・クォータ負担が高いため、公式推奨の `streamList` 移行を検討する。
+- `streamList` はgRPC接続を維持し、新着メッセージがあるとサーバーから受信する。切断時はnextPageTokenを再利用。
+- 代替の `list` 方式は最短間隔とpollingIntervalMillisを守るが、クォータ負担と遅延がある。
 - ログ出力をGitに含めないこと。履歴には第三者の発言・ユーザーIDが含まれる。
