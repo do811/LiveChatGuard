@@ -15,5 +15,8 @@
   "dry_run": true,
   "retention_days": 29,
   "minimum_poll_seconds": 120,
-  "fetch_mode": "stream"
+  "fetch_mode": "stream",
+  "delete_messages_after_permanent_ban": true,
+  "max_cleanup_messages": 0,
+  "daily_quota_limit": 10000
 }

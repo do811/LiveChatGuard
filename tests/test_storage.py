@@ -64,3 +64,29 @@ def test_action_appears_next_to_triggering_comment_even_when_api_is_delayed(tmp_
         assert [e["kind"] for e in entries] == ["message", "warning", "message"]
     finally:
         db.close()
+
+
+def test_legacy_database_migrates_cleanup_columns(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "legacy.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("""CREATE TABLE messages (
+            message_id TEXT PRIMARY KEY,
+            broadcast_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            body TEXT NOT NULL,
+            published_at TEXT NOT NULL
+        )""")
+        connection.execute("""INSERT INTO messages VALUES
+            ('old', 'b1', 'UC_A', 'Alice', '過去のコメント', '2026-01-01T00:00:00+00:00')""")
+    db = History(path)
+    try:
+        assert db.cleanup_candidates("b1", "UC_A") == ["old"]
+        db.mark_message_delete("old", "success")
+        assert db.cleanup_candidates("b1", "UC_A") == []
+        assert "過去のコメント" in user_txt("UC_A", db.history_for_user("UC_A"))
+        assert "削除成功" in user_txt("UC_A", db.history_for_user("UC_A"))
+    finally:
+        db.close()

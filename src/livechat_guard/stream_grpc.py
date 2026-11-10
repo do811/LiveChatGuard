@@ -136,17 +136,23 @@ class LiveChatStream:
         request = Request(live_chat_id=chat_id, part=["id", "snippet", "authorDetails"])
         if page_token:
             request.page_token = page_token
+        from .quota import QuotaLedger, oauth_project_key
+        from .settings import load_settings
+
         with grpc.secure_channel("youtube.googleapis.com:443", grpc.ssl_channel_credentials()) as ch:
             method = ch.unary_stream(
                 "/youtube.api.v3.V3DataLiveChatMessageService/StreamList",
                 request_serializer=lambda v: v.SerializeToString(),
                 response_deserializer=Response.FromString,
             )
-            self._call = method(
-                request, metadata=(("authorization", "Bearer " + token),),
-                wait_for_ready=False,
-            )
+            # Only the initial request is charged, not each streamed response.
+            quota = QuotaLedger(project=oauth_project_key(load_settings().client_secrets_path))
+            quota.record_attempt("liveChatMessages.streamList")
             try:
+                self._call = method(
+                    request, metadata=(("authorization", "Bearer " + token),),
+                    wait_for_ready=False,
+                )
                 if stop.is_set():
                     self._call.cancel()
                     return
@@ -154,6 +160,17 @@ class LiveChatStream:
                     if stop.is_set():
                         break
                     yield normalize(response)
+            except grpc.RpcError as exc:
+                if exc.code() == grpc.StatusCode.RESOURCE_EXHAUSTED:
+                    # RESOURCE_EXHAUSTED may mean rate limiting rather than
+                    # daily quota exhaustion; only mark daily exhaustion when
+                    # the gRPC detail explicitly identifies daily quota.
+                    detail = (exc.details() or "").lower()
+                    if any(term in detail for term in
+                           ("quotaexceeded", "daily limit", "dailylimitexceeded")):
+                        quota.mark_exceeded()
+                raise
             finally:
-                self._call.cancel()
+                if self._call is not None:
+                    self._call.cancel()
                 self._call = None

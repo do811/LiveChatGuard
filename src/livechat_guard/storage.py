@@ -33,7 +33,10 @@ class History:
                 channel_id TEXT NOT NULL,
                 display_name TEXT NOT NULL,
                 body TEXT NOT NULL,
-                published_at TEXT NOT NULL
+                published_at TEXT NOT NULL,
+                delete_outcome TEXT,
+                delete_note TEXT,
+                deleted_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_messages_user_time
                 ON messages(channel_id, published_at);
@@ -56,6 +59,10 @@ class History:
         existing = {r["name"] for r in self.connection.execute("PRAGMA table_info(actions)")}
         if "trigger_at" not in existing:
             self.connection.execute("ALTER TABLE actions ADD COLUMN trigger_at TEXT")
+        message_columns = {r["name"] for r in self.connection.execute("PRAGMA table_info(messages)")}
+        for column in ("delete_outcome", "delete_note", "deleted_at"):
+            if column not in message_columns:
+                self.connection.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
         self.connection.commit()
 
     def close(self) -> None:
@@ -73,6 +80,32 @@ class History:
         self.connection.commit()
         return cursor.rowcount == 1
 
+    def cleanup_candidates(self, broadcast_id: str, channel_id: str,
+                           limit: int = 0) -> list[str]:
+        """Known message IDs of this user on the current stream, oldest first.
+
+        0 limit means all. Never fetch more messages from YouTube just to delete them.
+        """
+        sql = """SELECT message_id FROM messages
+                 WHERE broadcast_id=? AND channel_id=?
+                   AND delete_outcome IS NULL
+                 ORDER BY published_at ASC, message_id ASC"""
+        if limit:
+            sql += " LIMIT ?"
+            params = (broadcast_id, channel_id, limit)
+        else:
+            params = (broadcast_id, channel_id)
+        return [row["message_id"] for row in self.connection.execute(sql, params)]
+
+    def mark_message_delete(self, message_id: str, outcome: str, note: str = "") -> None:
+        if outcome not in ("success", "not_found", "failure"):
+            raise ValueError("Unknown delete outcome")
+        self.connection.execute("""
+            UPDATE messages SET delete_outcome=?, delete_note=?, deleted_at=?
+            WHERE message_id=?
+        """, (outcome, note, utc_now(), message_id))
+        self.connection.commit()
+
     def add_action(
         self, broadcast_id: str, channel_id: str, display_name: str,
         kind: str, detail: str, outcome: str, ban_id: str | None = None,
@@ -85,6 +118,34 @@ class History:
         """, (broadcast_id, channel_id, display_name, kind, detail, outcome,
               timestamp or utc_now(), ban_id, trigger_at))
         self.connection.commit()
+
+    def active_permanent_bans(self, channel_id: str) -> list[dict]:
+        """Confirmed permanent bans with IDs, excluding successfully lifted ones.
+
+        Ban IDs are unique to a live chat, not the author's channel ID.
+        Failed / dry-run attempts to lift a ban do not change its active state.
+        """
+        rows = self.connection.execute("""
+            SELECT b.broadcast_id, b.channel_id, b.display_name, b.ban_id,
+                   b.timestamp, b.id
+              FROM actions AS b
+             WHERE b.channel_id=? AND b.kind='permanent_ban'
+                   AND b.outcome='success' AND b.ban_id IS NOT NULL
+                   AND b.ban_id <> ''
+                   AND NOT EXISTS (
+                       SELECT 1 FROM actions AS u
+                        WHERE u.kind='ban_lift' AND u.outcome IN ('success', 'not_found')
+                              AND u.ban_id=b.ban_id
+                   )
+             ORDER BY b.timestamp DESC, b.id DESC
+        """, (channel_id,)).fetchall()
+        seen: set[str] = set()
+        result = []
+        for row in rows:
+            if row['ban_id'] not in seen:
+                seen.add(row['ban_id'])
+                result.append(dict(row))
+        return result
 
     def recent_temporary_bans(self, channel_id: str, hours: int) -> int:
         """Only confirmed API bans count as prior offenses, not dry runs/errors."""
@@ -127,13 +188,15 @@ class History:
         messages = self.connection.execute("""
             SELECT published_at AS moment, published_at AS action_at,
                    0 AS row_order, 'message' AS kind,
-                   body AS detail, '' AS outcome, display_name, broadcast_id
+                   body AS detail, '' AS outcome, display_name, broadcast_id,
+                   delete_outcome, delete_note
             FROM messages WHERE channel_id = ?
         """, (channel_id,)).fetchall()
         actions = self.connection.execute("""
             SELECT COALESCE(trigger_at, timestamp) AS moment, timestamp AS action_at,
                    1 AS row_order, kind, detail, outcome,
-                   display_name, broadcast_id
+                   display_name, broadcast_id,
+                   NULL AS delete_outcome, NULL AS delete_note
             FROM actions WHERE channel_id = ?
         """, (channel_id,)).fetchall()
         return sorted([dict(r) for r in messages] + [dict(r) for r in actions],
@@ -156,13 +219,18 @@ def user_txt(channel_id: str, entries: list[dict]) -> str:
     name = entries[-1]["display_name"] if entries else "不明なユーザー"
     lines = [f"アカウント：{name}", f"チャンネルID：{channel_id}", ""]
     labels = {"warning": "警告発動", "temporary_ban": "一時制限発動",
-              "permanent_ban": "永久BAN発動"}
+              "permanent_ban": "永久BAN発動", "message_cleanup": "過去コメント削除", "ban_lift": "永久BAN解除"}
     for event in entries:
         if event["kind"] == "message":
             # Indent embedded newlines so multiline comments remain readable.
             body = str(event["detail"]).replace("\r\n", "\n").replace("\r", "\n")
             body = body.replace("\n", "\n    ")
             lines.append(f"[{local_display(event['moment'])}] {body}")
+            if event.get("delete_outcome"):
+                outcome_labels = {"success": "削除成功", "not_found": "既に存在しない（404）", "failure": "削除失敗"}
+                status = outcome_labels.get(event["delete_outcome"], event["delete_outcome"])
+                note = event.get("delete_note") or ""
+                lines.append(f"    YouTube上の削除：{status}" + (f" / {note}" if note else ""))
         else:
             title = labels.get(event["kind"], event["kind"])
             lines.append(f"＝＝{title}＝＝")

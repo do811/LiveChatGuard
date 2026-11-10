@@ -14,6 +14,8 @@ def test_defaults():
     assert config.window_seconds == 10
     assert config.fetch_mode == "stream"
     assert config.minimum_poll_seconds == 120
+    assert config.delete_messages_after_permanent_ban is True
+    assert config.max_cleanup_messages == 0
 
 
 def test_settings_roundtrip_and_no_token(tmp_path):
@@ -52,3 +54,12 @@ def test_old_settings_migrate_to_stream(tmp_path):
 def test_invalid_fetch_mode_rejected():
     with pytest.raises(ValueError):
         Settings(fetch_mode="invalid").validate()
+
+
+def test_cleanup_config_validation():
+    Settings(max_cleanup_messages=0).validate()
+    Settings(max_cleanup_messages=50).validate()
+    with pytest.raises(ValueError):
+        Settings(max_cleanup_messages=-1).validate()
+    with pytest.raises(ValueError):
+        Settings(max_cleanup_messages=10001).validate()

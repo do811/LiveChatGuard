@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "livechat-guard"
-version = "0.2.0"
+version = "0.3.0"
 description = "YouTube Live chat moderation assistant with a Japanese desktop GUI"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,6 +19,7 @@ dependencies = [
     "keyring>=25,<27",
     "grpcio>=1.62,<2",
     "protobuf>=4.25,<7",
+    "tzdata>=2025.2",
 ]
 
 [project.optional-dependencies]

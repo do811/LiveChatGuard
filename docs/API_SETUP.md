@@ -21,7 +21,7 @@
 - **ライブ配信0件**：配信は実際にライブ状態か、認証したGoogleアカウントがそのチャンネルの所有者か確認。
 - **403 insufficientPermissions**：誤ったアカウント・権限不足・許可スコープ不足の可能性。認証情報を削除して再認証。
 - **403 liveChatDisabled/liveChatEnded**：ライブチャットが無効または終了。
-- **429/403 rateLimitExceeded/quotaExceeded**：API制限。アプリは失敗時に再試行し、一定回数後に停止します。
+- **429/403 rateLimitExceeded/quotaExceeded**：API制限。`quotaExceeded` は無駄な再試行をせず監視停止し、レート制限など一時的な通信エラーは間隔を延ばして再試行します。
 - **アクセスがブロックされた**：OAuth同意画面の公開状態、テストユーザー、アプリ審査の条件を確認。
 - **再認証が必要**：Google OAuthテストモード等でリフレッシュトークンが短期間で失効する場合があります。
 
@@ -31,3 +31,9 @@ YouTube APIの利用にはGoogleの利用規約・デベロッパーポリシー
 - https://developers.google.com/youtube/v3/guides/authentication
 - https://developers.google.com/youtube/data/live/reference/rest/v3/liveChatBans/insert
 - https://developers.google.com/youtube/terms/developer-policies
+
+## v0.3.0：BAN解除とクォータ推定表示
+
+- 「ユーザー別履歴」で、このアプリが成功記録とBAN IDを保存した永久BANを解除できます。**監視停止中かつテストモードOFF**が必要です。
+- BAN解除は `liveChatBans.delete` を使用し、API呼び出し1回200ユニットを消費します。BAN解除によって削除済みコメントは復元されません。
+- ダッシュボードのクォータはこのアプリの推定消費量です。正確なプロジェクト全体の消費・残量は [Google CloudのYouTube API割り当て画面](https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas) から確認してください。

@@ -8,3 +8,4 @@ keyring>=25,<27
 
 grpcio>=1.62,<2
 protobuf>=4.25,<7
+tzdata>=2025.2

@@ -12,8 +12,10 @@ import grpc
 from PySide6.QtCore import QThread, Signal
 
 from .auth import connect_google
+from .ban_control import release_permanent_ban
 from .api_errors import is_quota_exhausted, is_rate_limited, readable_api_error
 from .moderation import StreakDetector, choose_restriction
+from .cleanup import cleanup_observed_messages
 from .settings import Settings
 from .storage import History
 from .youtube_api import YouTubeAPI
@@ -54,6 +56,30 @@ class BroadcastThread(QThread):
             self.failed.emit(str(exc))
 
 
+class BanLiftThread(QThread):
+    """BAN removal happens outside the GUI thread, and only when monitoring is stopped."""
+
+    completed = Signal(str, str)  # channel ID, detail
+    failed = Signal(str)
+
+    def __init__(self, db_path: Path, ban_record: dict):
+        super().__init__()
+        self.db_path = db_path
+        self.ban_record = ban_record
+
+    def run(self) -> None:
+        db = History(self.db_path)
+        record = self.ban_record
+        try:
+            api = YouTubeAPI()
+            detail = release_permanent_ban(db, api, record)
+            self.completed.emit(record["channel_id"], detail)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            db.close()
+
+
 class MonitorThread(QThread):
     notification = Signal(dict)
     status = Signal(str)
@@ -66,6 +92,10 @@ class MonitorThread(QThread):
         self.broadcast = broadcast
         self._stop_signal = Event()
         self._stream = LiveChatStream()
+        self._banned_channels: set[str] = set()  # only confirmed bans during this run
+        self._cleanup_count: dict[str, int] = {}  # quota limit across backlogged messages too
+        self._cleanup_disabled_channels: set[str] = set()  # stop repeated failing API calls
+        self._cleanup_cap_notified: set[str] = set()
 
     def stop(self) -> None:
         self._stop_signal.set()
@@ -77,7 +107,7 @@ class MonitorThread(QThread):
 
     def _action(self, db: History, api: YouTubeAPI, channel_id: str, name: str,
                 kind: str, detail: str, duration: int | None = None,
-                trigger_at: str | None = None) -> None:
+                trigger_at: str | None = None) -> str:
         bid = self.broadcast["id"]
         chat_id = self.broadcast["chat_id"]
         outcome = ("dry_run" if self.config.dry_run else
@@ -101,6 +131,58 @@ class MonitorThread(QThread):
         labels = {"dry_run": "テストのみ・実行なし", "local_only": "ローカル記録のみ",
                   "success": "API成功", "failure": "API失敗"}
         self._notify(kind, channel_id, name, f"{detail} 【{labels.get(outcome, outcome)}】")
+        if kind == "permanent_ban" and outcome == "success":
+            self._banned_channels.add(channel_id)
+            if self.config.delete_messages_after_permanent_ban:
+                self._cleanup_messages(db, api, channel_id, name, trigger_at=trigger_at)
+        return outcome
+
+    def _cleanup_messages(self, db: History, api: YouTubeAPI, channel_id: str,
+                          name: str, *, trigger_at: str | None = None) -> None:
+        """Delete every *observed* message in this broadcast after confirmed BAN.
+
+        Does not alter local comment text, which is kept for the audit/history UI.
+        API quota: 20 units per attempted deletion. 0 limit means uncapped.
+        """
+        if (self.config.dry_run or self._stop_signal.is_set() or
+                channel_id in self._cleanup_disabled_channels):
+            return
+        cap = self.config.max_cleanup_messages
+        used = self._cleanup_count.get(channel_id, 0)
+        remaining = max(0, cap - used) if cap else 0
+        if cap and remaining == 0:
+            if channel_id not in self._cleanup_cap_notified:
+                self._cleanup_cap_notified.add(channel_id)
+                self._notify("message_cleanup", channel_id, name,
+                             f"削除件数の上限{cap}件に到達。残りは未削除です。")
+            return
+        result = cleanup_observed_messages(
+            db, api, self.broadcast["id"], channel_id,
+            remaining_limit=remaining, stop_signal=self._stop_signal,
+        )
+        self._cleanup_count[channel_id] = used + result.attempted
+        if result.failures:
+            # A systemic API failure must not cause one more DELETE per new chat message.
+            self._cleanup_disabled_channels.add(channel_id)
+        if result.quota_exhausted:
+            self._stop_signal.set()
+            self.failed.emit("コメント削除中にAPI割り当て超過。監視と追加削除を停止します。")
+        used = self._cleanup_count[channel_id]
+        success, missing, failures = result.successes, result.not_found, result.failures
+        stopped, pending = result.stopped, result.pending
+        # Include an explicit summary in GUI history/TXT even if some attempts failed.
+        pending = len(db.cleanup_candidates(self.broadcast["id"], channel_id))
+        summary = (f"削除成功 {success}件 / 既に存在しない {missing}件 / 失敗 {failures}件"
+                   f" / 未処理 {pending}件（今回の削除API {result.attempted}回、推定 {result.attempted * 20}ユニット）")
+        if stopped:
+            summary += " / 中断（停止要求・APIエラー・上限等）"
+        elif cap and used >= cap and pending:
+            summary += f" / 設定上限 {cap}件に到達"
+        outcome = ("success" if not failures and pending == 0 else
+                   "partial" if success or missing else "failure")
+        db.add_action(self.broadcast["id"], channel_id, name, "message_cleanup",
+                      summary, outcome, trigger_at=trigger_at)
+        self._notify("message_cleanup", channel_id, name, summary)
 
     def _handle_message(self, db: History, api: YouTubeAPI, detector: StreakDetector,
                         raw: dict, started: datetime) -> None:
@@ -124,6 +206,12 @@ class MonitorThread(QThread):
         if not db.add_message(message_id, self.broadcast["id"], channel_id, name, body, normalized):
             return  # Prevent duplicate messages on reconnect / repeated pages.
         self._notify("message", channel_id, name, body)
+        # Stream pages can contain comments published just before BAN succeeded.
+        # Remove those newly observed messages without issuing another BAN.
+        if channel_id in self._banned_channels:
+            if self.config.delete_messages_after_permanent_ban and not self.config.dry_run:
+                self._cleanup_messages(db, api, channel_id, name, trigger_at=normalized)
+            return
         if (channel.get("isChatOwner") or
             (self.config.exclude_moderators and channel.get("isChatModerator")) or
             (self.config.exclude_members and channel.get("isChatSponsor")) or

@@ -32,13 +32,18 @@ class Settings:
     permanent_after: int = 3  # 3rd effective violation in staged mode
     repeat_window_hours: int = 24
     chat_warning: bool = True
+    delete_messages_after_permanent_ban: bool = True
+    max_cleanup_messages: int = 0  # 0 = all observed messages (20 quota units each)
     exclude_moderators: bool = True
     exclude_members: bool = False
     excluded_channels: str = ""  # one channel ID per line
     dry_run: bool = True  # Safe on first launch: no API writes
     retention_days: int = 29  # YouTube API Data retention upper bound: 30 days
+    daily_quota_limit: int = 10000  # Set to the actual Cloud project daily limit
 
     def validate(self) -> None:
+        if not 1 <= self.daily_quota_limit <= 100000000:
+            raise ValueError("クォータ上限は1～100,000,000ユニットにしてください。")
         if self.fetch_mode not in ("stream", "poll"):
             raise ValueError("不正なコメント取得方式です。")
         if not 5 <= self.minimum_poll_seconds <= 300:
@@ -57,6 +62,8 @@ class Settings:
             raise ValueError("永久BANまでの回数は2～10で指定してください。")
         if not 1 <= self.repeat_window_hours <= 720:
             raise ValueError("再犯判定期間は1～720時間で指定してください。")
+        if not 0 <= self.max_cleanup_messages <= 10000:
+            raise ValueError("BAN後の削除件数上限は0～10000で指定してください（0=全件）。")
         if not 1 <= self.retention_days <= 29:
             raise ValueError("ログ保存日数は1～29日にしてください。")
 
