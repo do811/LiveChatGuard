@@ -1,27 +1,42 @@
-# コメント取得方式について（v0.2.0）
+# ストリーミング受信の障害対応（v0.4.0）
 
-## おすすめ：streamList（gRPC）
+## 仕様
 
-Google公式 `liveChatMessages.streamList` は、クライアントからYouTubeへ接続を確立し、YouTubeが新着コメントをpushする方式です。定期的な空振り問い合わせを回避できるため、BAN用途ではこちらを推奨します。
+`liveChatMessages.streamList` は接続を維持して新しいチャットを受信しますが、接続が正常に終わることも通信エラーになることもあります。**30秒以内に接続が終わったという事実だけでAPI障害とは判断しません。**
 
-- API参照：https://developers.google.com/youtube/data/live/reference/rest/v3/liveChatMessages/streamList
-- Pythonガイド：https://developers.google.com/youtube/data/live/streaming-live-chat
-- 接続リクエストのクォータコスト：5ユニット
-- 認証：既存のOAuthアクセストークン。APIキーの追加作成は不要
-- 再接続：最後に取得した `nextPageToken` で再開
-- データ判定：各 `publishedAt` を使用。到着時刻では判定しない
-- クォータ上限や `RESOURCE_EXHAUSTED`：安全のため無限にリトライせず停止
+- `EOF`：サーバーからのストリームが通常終了した。故障とは限らず、最後の `nextPageToken` から再開
+- `UNAVAILABLE`、`DEADLINE_EXCEEDED`、`INTERNAL` など：一時的な通信障害として再接続
+- `UNAUTHENTICATED` / `PERMISSION_DENIED` / `INVALID_ARGUMENT` / `FAILED_PRECONDITION` / `NOT_FOUND`：原則停止して原因を表示
+- `RESOURCE_EXHAUSTED`：クォータや頻度制限のおそれがあるため自動再試行しない
+- `offlineAt`：配信終了として停止
+- 手動停止：ストリームをキャンセルし再接続しない
 
-`src/livechat_guard/stream_grpc.py` は公式プロトコル定義のうち、このアプリが参照するフィールドのみをprotobuf互換で定義しています。利用者のPCでコード生成する必要はありません。公式APIの変更時にはこのファイルの互換性を確認してください。
+正常終了・通信エラーの後は、最低5〜15秒の待機を挟みます。短時間終了・新着なし終了が続くと待機が増え、**10分以内の接続開始数が10回に達したときには回数制限を優先**します。接続維持の失敗が続いても無限の高速再試行はしません。
 
-## 予備：REST定期取得
+`nextPageToken` は接続し直す際に再利用します。コメントの重複は既存のSQLiteのメッセージIDで排除します。トークン保存は同じ監視セッションのメモリ内のみです。アプリを終了するとサーバーから最近のログを取得し、監視開始前の投稿時刻は従来どおり除外されます。
 
-`liveChatMessages.list` を指定間隔で呼び出す方式です。新規設定の最短間隔は120秒です。YouTubeが返す `pollingIntervalMillis` より短くは呼びません。API仕様で1回5ユニットかかるため、**2分ごとの場合は約150ユニット/時間**です（配信検索・警告・制限の操作を除く）。
+## 障害ログ
 
-取得後は各コメントの `publishedAt` を利用して連投回数を更新します。ただし2分間に大量のコメントが届く配信では、APIの返却件数・ページ送り制約によって取りこぼしが起こりえます。リアルタイム性が必要なBAN目的では使用を推奨しません。
+ログは `%LOCALAPPDATA%\LiveChatGuard\logs\livechat_guard.log`（Windows）に保存されます。監視ダッシュボードの **「障害ログの保存フォルダを開く」** を使って確認してください。通常は `livechat_guard.log`、古い履歴は `.1`、`.2`、`.3` にローテートされます。
 
-## バージョン更新時
+典型例（架空）:
 
-v0.1.1までの設定ファイルに `fetch_mode` がない場合は、自動で `stream`（新規定義のデフォルト）になります。旧設定の `minimum_poll_seconds` は予備のREST方式用として引き継がれます。
+```text
+2026-11-11 12:00:00 INFO Thread-1 stream_connect attempt=1 resume=no
+2026-11-11 12:02:00 WARNING Thread-1 stream_rpc_error code=UNAVAILABLE detail=...
+2026-11-11 12:02:00 WARNING Thread-1 stream_disconnected attempt=1 code=UNAVAILABLE duration_s=120.0 responses=6 items=7 progress=True empty_streak=0 short_streak=0 retry_s=5.0 detail=...
+2026-11-11 12:02:05 INFO Thread-1 stream_connect attempt=2 resume=yes
+```
 
-**重要：** `quotaExceeded` は、すでに使用したユニットの問題です。取得方式を変えても使用枠は即時に回復しません。Google Cloud Consoleで割り当てと残量を確認してください。
+共有する場合は、トークンをログに出さないよう設計していますが、パスやユーザー情報などの機微な情報が紛れ込んでいないか必ず確認してから共有してください。**GoogleのOAuthクライアントJSON、history.sqlite3、settings.jsonを公開しないでください。**
+
+## 実配信の検証
+
+1. テストモードONで限定公開配信を開始
+2. ライブチャットを複数件送信しGUIに表示されることを確認
+3. 20〜30分ほど接続維持と切断の有無を確認
+4. 切断したらログの `stream_disconnected` / `stream_rpc_error` を比較
+5. クォータ使用量はGoogle Cloud Consoleで実測確認（ダッシュボードは推定値）
+
+この環境では実YouTubeアカウントを使ったE2Eテストは未実施です。復旧処理が必ず動く保証ではありません。
+

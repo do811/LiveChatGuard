@@ -9,7 +9,7 @@ See https://developers.google.com/youtube/data/live/streaming-live-chat
 
 from __future__ import annotations
 
-from threading import Event
+from threading import Event, Lock
 from typing import Iterator
 
 import grpc
@@ -122,10 +122,14 @@ class LiveChatStream:
 
     def __init__(self):
         self._call = None
+        self._lock = Lock()
 
     def cancel(self):
-        if self._call is not None:
-            self._call.cancel()
+        """Safe to call from the UI thread while a stream is blocked in recv."""
+        with self._lock:
+            call = self._call
+        if call is not None:
+            call.cancel()
 
     def responses(self, chat_id: str, page_token: str | None, stop: Event) -> Iterator[dict]:
         if stop.is_set():
@@ -149,14 +153,16 @@ class LiveChatStream:
             quota = QuotaLedger(project=oauth_project_key(load_settings().client_secrets_path))
             quota.record_attempt("liveChatMessages.streamList")
             try:
-                self._call = method(
+                call = method(
                     request, metadata=(("authorization", "Bearer " + token),),
                     wait_for_ready=False,
                 )
+                with self._lock:
+                    self._call = call
                 if stop.is_set():
-                    self._call.cancel()
+                    call.cancel()
                     return
-                for response in self._call:
+                for response in call:
                     if stop.is_set():
                         break
                     yield normalize(response)
@@ -171,6 +177,8 @@ class LiveChatStream:
                         quota.mark_exceeded()
                 raise
             finally:
-                if self._call is not None:
-                    self._call.cancel()
-                self._call = None
+                with self._lock:
+                    active_call = self._call
+                    self._call = None
+                if active_call is not None:
+                    active_call.cancel()

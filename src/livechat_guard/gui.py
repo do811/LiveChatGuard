@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from .auth import disconnect_google
+from .diagnostics import get_logger, log_path, safe_error_detail
 from .quota import QuotaLedger, oauth_project_key
 from .settings import Settings, data_dir, load_settings, save_settings
 from .storage import History, user_txt
@@ -47,7 +48,7 @@ class MainWindow(QMainWindow):
         self.broadcasts: list[dict] = []
         self.selected_channel_id = ""
 
-        self.setWindowTitle("LiveChat Guard v0.3.0")
+        self.setWindowTitle("LiveChat Guard v0.4.0")
         self.resize(1050, 740)
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -88,6 +89,12 @@ class MainWindow(QMainWindow):
         layout.addLayout(actions)
         self.monitor_state = QLabel("停止中")
         layout.addWidget(self.monitor_state)
+        diagnostic_row = QHBoxLayout()
+        diagnostic_button = QPushButton("障害ログの保存フォルダを開く")
+        diagnostic_button.clicked.connect(self._open_diagnostic_logs)
+        diagnostic_row.addWidget(diagnostic_button)
+        diagnostic_row.addWidget(QLabel("APIエラー・切断・再接続をローカルに記録します（認証トークンやコメント本文は記録しません）"))
+        layout.addLayout(diagnostic_row)
 
         quota_group = QGroupBox("YouTube API クォータ（このアプリの推定値）")
         quota_layout = QVBoxLayout(quota_group)
@@ -414,6 +421,7 @@ class MainWindow(QMainWindow):
         self.monitor.notification.connect(self._receive_event)
         self.monitor.status.connect(self.monitor_state.setText)
         self.monitor.failed.connect(self._worker_error)
+        self.monitor.notice.connect(self._worker_notice)
         self.monitor.finished.connect(self._monitor_finished)
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -433,6 +441,14 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.fetch_button.setEnabled(True)
         self._update_unban_button()
+
+    def _open_diagnostic_logs(self) -> None:
+        folder = log_path().parent
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def _worker_notice(self, detail: str) -> None:
+        self._receive_event({"label": "接続通知", "name": "システム", "detail": detail})
 
     def _worker_error(self, error: str) -> None:
         self.statusBar().showMessage(error, 16000)
@@ -632,11 +648,22 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    import sys
+
+    logger = get_logger()
+    old_hook = sys.excepthook
+
+    def log_uncaught(exc_type, exc_value, exc_traceback):
+        logger.critical("uncaught_gui_exception", exc_info=(exc_type, exc_value, exc_traceback))
+        old_hook(exc_type, exc_value, exc_traceback)
+
+    sys.excepthook = log_uncaught
     app = QApplication([])
     app.setApplicationName("LiveChatGuard")
     try:
         window = MainWindow()
     except Exception as exc:
+        logger.exception("startup_failed")
         QMessageBox.critical(None, "起動失敗", f"設定またはデータを読み込めませんでした。\n{exc}")
         raise SystemExit(1) from exc
     window.show()
